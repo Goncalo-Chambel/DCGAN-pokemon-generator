@@ -1,8 +1,10 @@
 import tensorflow as tf
-from tensorflow.keras import preprocessing
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv2D,Dropout,Dense,Flatten,Conv2DTranspose,BatchNormalization,LeakyReLU,Reshape
+from keras.models import Sequential
+from keras.layers import Conv2D,Dropout,Dense,Flatten,Conv2DTranspose,BatchNormalization,LeakyReLU,Reshape
+from keras.optimizers import Adam
 import numpy as np
+from PIL import Image
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 import os
 from zipfile import ZipFile
@@ -11,157 +13,136 @@ import glob
 import time
 
 batch_size = 32
-dataset = preprocessing.image_dataset_from_directory(
-    "pokemon_jpg/pokemon_jpg", label_mode=None, image_size=(64, 64), batch_size=batch_size
-)
-dataset = dataset.map(lambda x: x / 255.0)
-
-for x in dataset:
-    plt.axis("off")
-    plt.imshow((x.numpy() * 255).astype("int32")[0])
-    break
-# plt.show()
+all_image_path = []
+for path in os.listdir('./pokemon_jpg/pokemon_jpg'):
+    if '.jpg' in path:
+        all_image_path.append(os.path.join('./pokemon_jpg/pokemon_jpg', path))
 
 
+training_images = [np.array((Image.open(path)).resize((64,64))) for path in all_image_path]
 
 
-discriminator = Sequential(
-    [
-        keras.Input(shape=(64, 64, 3)),
-        keras.layers.Conv2D(64, kernel_size=4, strides=2, padding="same",
-                      kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02), use_bias=False),
-        keras.layers.LeakyReLU(0.2),
+for i in range(len(training_images)):
+    training_images[i] = ((training_images[i] - training_images[i].min()) / (255 - training_images[i].min()))
 
-        keras.layers.Conv2D(128, kernel_size=4, strides=2, padding="same",
-                      kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02), use_bias=False),
-        keras.layers.BatchNormalization(momentum=0.1, epsilon=0.8, center=1.0, scale=0.02),
-        keras.layers.LeakyReLU(0.2),
+training_images = np.array(training_images)
+latent_dim = 100
+optimizer = Adam(lr=0.0002, beta_1=0.5)
 
-        keras.layers.Conv2D(256, kernel_size=4, strides=2, padding="same",
-                            kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02),
-                            use_bias=False),
-        keras.layers.BatchNormalization(momentum=0.1, epsilon=0.8, center=1.0, scale=0.02),
-        keras.layers.LeakyReLU(0.2),
+def get_generator(optimizer):
+    generator = Sequential()
 
-        keras.layers.Conv2D(512, kernel_size=4, strides=2, padding="same",
-                            kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02),
-                            use_bias=False),
-        keras.layers.BatchNormalization(momentum=0.1, epsilon=0.8, center=1.0, scale=0.02),
-        keras.layers.LeakyReLU(0.2),
+    generator.add(Dense(4*4*512, input_shape=[latent_dim]))
+    generator.add(Reshape([4, 4, 512]))
 
-        keras.layers.Flatten(),
-        keras.layers.Dropout(0.2),
-        keras.layers.Dense(1, activation='sigmoid')
-    ],
-    name="discriminator",
-)
-discriminator.summary()
+    generator.add(Conv2DTranspose(128, kernel_size=4, strides=2, padding='same'))
+    generator.add(BatchNormalization())
+    generator.add(LeakyReLU(0.2))
 
-latent_dim = 128
+    generator.add(Conv2DTranspose(256, kernel_size=4, strides=2, padding='same'))
+    generator.add(BatchNormalization())
+    generator.add(LeakyReLU(0.2))
 
-generator = keras.Sequential(
-    [
-        keras.Input(shape=(latent_dim,)),
-        keras.layers.Dense(8 * 8 * 128),
-        keras.layers.Reshape((8, 8, 128)),
-        keras.layers.Conv2DTranspose(64 * 2, kernel_size=4, strides=2, padding='same',
-                                     kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02),
-                                     use_bias=False),
-        keras.layers.BatchNormalization(momentum=0.1, epsilon=0.8, center=1.0, scale=0.02),
-        keras.layers.ReLU(),
+    generator.add(Conv2DTranspose(512, kernel_size=4, strides=2, padding='same'))
+    generator.add(BatchNormalization())
+    generator.add(LeakyReLU(0.2))
 
-        keras.layers.Conv2DTranspose(64 * 4, kernel_size=4, strides=2, padding='same',
-                                     kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02),
-                                     use_bias=False),
-        keras.layers.BatchNormalization(momentum=0.1, epsilon=0.8, center=1.0, scale=0.02),
-        keras.layers.ReLU(),
+    generator.add(Conv2DTranspose(3, kernel_size=5, strides=2, padding='same', activation='tanh'))
+    generator.compile(loss='binary_crossentropy', optimizer=optimizer)
+    return generator
 
-        keras.layers.Conv2DTranspose(64 * 8, kernel_size=4, strides=2, padding='same',
-                                     kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02),
-                                     use_bias=False),
-        keras.layers.BatchNormalization(momentum=0.1, epsilon=0.8, center=1.0, scale=0.02),
-        keras.layers.ReLU(),
-
-        keras.layers.Conv2D(3, kernel_size=5, padding='same',
-                                     kernel_initializer=tf.keras.initializers.RandomNormal(mean=0.0, stddev=0.02),
-                                     use_bias=False, activation='tanh')
-    ],
-    name="generator",
-)
+generator = get_generator(optimizer)
 generator.summary()
 
 noise = tf.random.normal([1, latent_dim])
 generated_image = generator(noise, training=False)
-plt.imshow(generated_image[0])
+# plt.imshow(generated_image[0, :, :, 0])
 # plt.show()
 
+def get_discriminator(optimizer):
+    discriminator = Sequential()
+
+    discriminator.add(Conv2D(64, kernel_size=4, strides=2, padding='same', input_shape=[64, 64, 3]))
+    discriminator.add(LeakyReLU(0.2))
+    discriminator.add(Dropout(0.4))
+
+    discriminator.add(Conv2D(128, kernel_size=4, strides=2, padding='same'))
+    discriminator.add(BatchNormalization())
+    discriminator.add(LeakyReLU(0.2))
+
+    discriminator.add(Conv2D(256, kernel_size=4, strides=2, padding='same'))
+    discriminator.add(BatchNormalization())
+    discriminator.add(LeakyReLU(0.2))
+
+    discriminator.add(Conv2D(512, kernel_size=4, strides=2, padding='same'))
+    discriminator.add(BatchNormalization())
+    discriminator.add(LeakyReLU(0.2))
+
+    discriminator.add(Flatten())
+    discriminator.add(Dropout(0.2))
+    discriminator.add(Dense(1, activation='sigmoid'))
+
+    discriminator.compile(loss='binary_crossentropy', optimizer=optimizer)
+    return discriminator
+
+discriminator = get_discriminator(optimizer)
+discriminator.summary()
 decision = discriminator(generated_image)
-print('decision', decision)
-binary_cross_entropy = tf.keras.losses.BinaryCrossentropy()
+print(decision)
 
-def generator_loss(label, fake_output):
-    gen_loss = binary_cross_entropy(label, fake_output)
-    return gen_loss
-
-def discriminator_loss(label, output):
-    disc_loss = binary_cross_entropy(label, output)
-    return disc_loss
-
-generator_optimizer = tf.keras.optimizers.Adam(0.0002, beta_1=0.5, beta_2=0.999)
-discriminator_optimizer = tf.keras.optimizers.Adam(0.0002, beta_1=0.5, beta_2=0.999)
+def get_gan_network(discriminator, random_dim, generator, optimizer):
+    gan = Sequential([generator, discriminator])
+    discriminator.trainable = False
+    gan.compile(loss='binary_crossentropy', optimizer=optimizer)
+    return gan
 
 
-@tf.function
-def train_step(images):
-    noise = tf.random.normal([batch_size, latent_dim])
-
-    with tf.GradientTape() as disc_tape1:
-        generated_images = generator(noise, training=True)
-
-        real_output = discriminator(images, training=True)
-        real_targets = tf.ones_like(real_output)
-        disc_loss1 = discriminator_loss(real_targets, real_output)
-
-    gradients_disc1 = disc_tape1.gradient(disc_loss1, discriminator.trainable_variables)
-    discriminator_optimizer.apply_gradients(zip(gradients_disc1, discriminator.trainable_variables))
-
-    with tf.GradientTape() as disc_tape2:
-        fake_output = discriminator(generated_images, training=True)
-        fake_targets = tf.zeros_like(fake_output)
-        disc_loss2 = discriminator_loss(fake_targets, fake_output)
-
-    gradients_disc2 = disc_tape2.gradient(disc_loss2, discriminator.trainable_variables)
-    discriminator_optimizer.apply_gradients(zip(gradients_disc2, discriminator.trainable_variables))
-
-    with tf.GradientTape() as gen_tape:
-        generated_images = generator(noise, training=True)
-        fake_output = discriminator(generated_images, training=True)
-        real_targets = tf.ones_like(fake_output)
-        gen_loss = generator_loss(real_targets, fake_output)
-
-    gradients_gen = gen_tape.gradient(gen_loss, generator.trainable_variables)
-    generator_optimizer.apply_gradients(zip(gradients_gen, generator.trainable_variables))
-
-
-seed = tf.random.normal([16, latent_dim])
-def train(dataset, epochs):
-    for epoch in range(epochs):
-        start = time.time()
-        for image_batch in dataset:
-            train_step(image_batch)
-        generate_and_save_images(generator, epoch+1, seed)
-
-        print('Time for epoch {} is {} sec'.format(epoch + 1, time.time() - start))
-    generate_and_save_images(generator, epochs, seed)
+gan = get_gan_network(discriminator, latent_dim, generator, optimizer)
 
 
 def generate_and_save_images(model, epoch, test_input):
-    random_latent_vectors = tf.random.normal(shape=(3, latent_dim))
+    random_latent_vectors = tf.random.normal(shape=(16, latent_dim))
     generated_images = model(random_latent_vectors)
     generated_images *= 255
     generated_images.numpy()
     for i in range(3):
-        img = keras.preprocessing.image.array_to_img(generated_images[i])
+        img = tf.keras.preprocessing.image.array_to_img(generated_images[i])
         img.save("generated_images/generated_img_%03d_%d.png" % (epoch, i))
 
-train(dataset, 50)
+
+seed = tf.random.normal([16, latent_dim])
+
+def train(epochs):
+    disc_loss = []
+    gen_loss = []
+    batch_count = int(training_images.shape[0] / batch_size)
+
+    for epoch in range(epochs):
+        print('-'*15, 'Epoch %d' %epoch, ''*15)
+
+        for _ in tqdm(range(batch_count)):
+            noise = np.random.normal(0, 1, size=[batch_size, latent_dim])
+            image_batch = training_images[np.random.randint(0, training_images.shape[0], size=batch_size)]
+
+            generated_images = generator.predict_on_batch(noise)
+            X = np.concatenate([image_batch, generated_images])
+            y_dis = np.zeros(2 * batch_size)
+            # One-sided label smoothing
+            y_dis[:batch_size] = 1
+
+            # Train discriminator
+            discriminator.trainable = True
+            current_disc_loss = discriminator.train_on_batch(X, y_dis)
+
+            # Train generator
+            noise = np.random.normal(0, 1, size=[batch_size, latent_dim])
+            y_gen = np.ones(batch_size)
+            discriminator.trainable = False
+            current_gen_loss = gan.train_on_batch(noise, y_gen)
+
+        # print('Epoch: %d,  Loss: D = %.3f, G = %.3f' %(epoch+1, current_disc_loss, current_gen_loss))
+        generate_and_save_images(generator, epoch + 1, seed)
+    generate_and_save_images(generator, epochs, seed)
+
+train(200)
+
